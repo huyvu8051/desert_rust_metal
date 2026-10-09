@@ -1,0 +1,22 @@
+[workspace]
+
+[package]
+name = "desert_rust_metal"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# Only for the shared shader source, the glTF->Metal loader and the matrix
+# helpers. Nothing here touches the ECS-driven renderer or Bevy.
+metal_renderer = { path = "../metal_renderer" }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+objc = "0.2"
+core-graphics = "0.25"
+metal = "0.33.0"
+
+[profile.release]
+opt-level = 3

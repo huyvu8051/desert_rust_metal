@@ -1,0 +1,43 @@
+name: DesertRustMetal
+options:
+  bundleIdPrefix: com.huyvu8051
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+
+targets:
+  DesertRustMetal:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+      # Staged by deploy.sh, laid out the way the loader expects it.
+      - path: build/bundle/assets
+        type: folder
+        buildPhase: resources
+    info:
+      path: Sources/Info.plist
+      properties:
+        CFBundleDisplayName: RustMetal
+        UILaunchScreen: {}
+        UIStatusBarHidden: true
+        UIRequiresFullScreen: true
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationLandscapeRight
+          - UIInterfaceOrientationLandscapeLeft
+        CADisableMinimumFrameDurationOnPhone: true
+        MetalHudEnabled: true
+    dependencies:
+      - sdk: Metal.framework
+      - sdk: QuartzCore.framework
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.huyvu8051.desertrustmetal
+        DEVELOPMENT_TEAM: GNNA6PH896
+        CODE_SIGN_STYLE: Automatic
+        SWIFT_VERSION: "5.0"
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/Bridging-Header.h
+        MTL_ENABLE_DEBUG_INFO: NO
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+        LIBRARY_SEARCH_PATHS: $(inherited) $(PROJECT_DIR)/build/lib
+        OTHER_LDFLAGS: $(inherited) -ldesert_rust_metal
