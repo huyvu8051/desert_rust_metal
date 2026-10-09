@@ -68,6 +68,7 @@ pub struct RustMetal {
     camera_yaw: f32,
     camera_pitch: f32,
     stats: stats::FramePhaseStats,
+    last_command_buffer: Option<metal::CommandBuffer>,
 }
 
 impl RustMetal {
@@ -89,6 +90,7 @@ impl RustMetal {
             normal_map: !env_flag("GFX_NO_NORMAL_MAP"),
             specular: !env_flag("GFX_NO_SPECULAR"),
             point_light: !env_flag("GFX_NO_POINT_LIGHT"),
+            flat: env_flag("GFX_FLAT"),
         };
         let source = format!("{}{SPONZA_SHADER_SOURCE}", features.defines());
         let library = device
@@ -154,6 +156,7 @@ impl RustMetal {
             camera_yaw: 0.0,
             camera_pitch: 0.0,
             stats: stats::FramePhaseStats::default(),
+            last_command_buffer: None,
         }
     }
 
@@ -189,6 +192,20 @@ impl RustMetal {
         let (width, height) = (drawable_size.width as u64, drawable_size.height as u64);
         let depth_texture = self.ensure_depth(width, height);
         let Some(drawable) = self.layer.next_drawable() else { return };
+
+        // The same measurement the ECS rig takes, so the two GPU numbers are
+        // comparable. Read after next_drawable: before the display hands one
+        // back the GPU may not have retired the frame, and the timestamps are
+        // zero until it has.
+        let mut gpu_ms = 0.0;
+        if let Some(previous) = self.last_command_buffer.take() {
+            let raw = previous.as_ptr() as *mut Object;
+            let start: f64 = unsafe { msg_send![raw, GPUStartTime] };
+            let end: f64 = unsafe { msg_send![raw, GPUEndTime] };
+            if end > start {
+                gpu_ms = ((end - start) * 1000.0) as f32;
+            }
+        }
 
         let encode_start = std::time::Instant::now();
 
@@ -269,12 +286,14 @@ impl RustMetal {
         encoder.end_encoding();
         command_buffer.present_drawable(drawable);
         command_buffer.commit();
+        self.last_command_buffer = Some(command_buffer.to_owned());
 
         let encode_ms = encode_start.elapsed().as_secs_f32() * 1000.0;
         self.stats.record(
             frame_start.elapsed().as_secs_f32() * 1000.0,
             encode_ms,
             self.meshes.len(),
+            gpu_ms,
         );
     }
 }
