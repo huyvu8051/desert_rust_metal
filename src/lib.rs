@@ -25,6 +25,11 @@ use objc::{msg_send, sel, sel_impl};
 
 const MAP_PATH: &str = "assets/maps/desert_city/scene.gltf";
 
+/// Shared with desert_rust_bevy, which orients its DirectionalLight to match.
+/// The two rigs have to light the scene identically or their frame costs are
+/// not comparable.
+pub const SUN_DIRECTION: [f32; 3] = [0.47, -0.78, 0.41];
+
 fn env_flag(name: &str) -> bool {
     std::env::var(name).is_ok_and(|value| value != "0")
 }
@@ -55,7 +60,9 @@ pub struct RustMetal {
     queue: metal::CommandQueue,
     layer: MetalLayer,
     pipeline: RenderPipelineState,
+    blend_pipeline: RenderPipelineState,
     depth_state: metal::DepthStencilState,
+    blend_depth_state: metal::DepthStencilState,
     depth_texture: Option<metal::Texture>,
     depth_size: (u64, u64),
     sampler: metal::SamplerState,
@@ -86,7 +93,11 @@ impl RustMetal {
         let queue = device.new_command_queue();
 
         let features = ShaderFeatures {
-            shadows: !env_flag("GFX_NO_SHADOWS"),
+            // This rig has no shadow pass, so the depth texture it would sample
+            // is never written and reads as undefined — which darkened the
+            // whole scene against the ECS rig, where shadow quality 0 compiles
+            // the sampling out. Off by default here for the same reason.
+            shadows: env_flag("GFX_SHADOWS"),
             normal_map: !env_flag("GFX_NO_NORMAL_MAP"),
             specular: !env_flag("GFX_NO_SPECULAR"),
             point_light: !env_flag("GFX_NO_POINT_LIGHT"),
@@ -97,17 +108,39 @@ impl RustMetal {
             .new_library_with_source(&source, &CompileOptions::new())
             .expect("scene shader failed to compile");
 
-        let descriptor = RenderPipelineDescriptor::new();
-        descriptor.set_vertex_function(Some(&library.get_function("sponza_vertex", None).unwrap()));
-        descriptor.set_fragment_function(Some(&library.get_function("sponza_fragment", None).unwrap()));
-        descriptor.color_attachments().object_at(0).unwrap().set_pixel_format(MTLPixelFormat::BGRA8Unorm);
-        descriptor.set_depth_attachment_pixel_format(MTLPixelFormat::Depth32Float);
-        let pipeline = device.new_render_pipeline_state(&descriptor).expect("pipeline");
+        // Two pipelines and two depth states, matching what the shared renderer
+        // does: opaque with blending off and depth writes on, transparent with
+        // blending on and depth writes off so it cannot occlude what follows.
+        let build_pipeline = |blending: bool| {
+            let descriptor = RenderPipelineDescriptor::new();
+            descriptor.set_vertex_function(Some(&library.get_function("sponza_vertex", None).unwrap()));
+            descriptor.set_fragment_function(Some(&library.get_function("sponza_fragment", None).unwrap()));
+            let color = descriptor.color_attachments().object_at(0).unwrap();
+            color.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+            color.set_blending_enabled(blending);
+            if blending {
+                color.set_rgb_blend_operation(metal::MTLBlendOperation::Add);
+                color.set_alpha_blend_operation(metal::MTLBlendOperation::Add);
+                color.set_source_rgb_blend_factor(metal::MTLBlendFactor::SourceAlpha);
+                color.set_source_alpha_blend_factor(metal::MTLBlendFactor::SourceAlpha);
+                color.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
+                color.set_destination_alpha_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
+            }
+            descriptor.set_depth_attachment_pixel_format(MTLPixelFormat::Depth32Float);
+            device.new_render_pipeline_state(&descriptor).expect("pipeline")
+        };
+        let pipeline = build_pipeline(false);
+        let blend_pipeline = build_pipeline(true);
 
         let depth_descriptor = metal::DepthStencilDescriptor::new();
         depth_descriptor.set_depth_compare_function(metal::MTLCompareFunction::Less);
         depth_descriptor.set_depth_write_enabled(true);
         let depth_state = device.new_depth_stencil_state(&depth_descriptor);
+
+        let blend_depth_descriptor = metal::DepthStencilDescriptor::new();
+        blend_depth_descriptor.set_depth_compare_function(metal::MTLCompareFunction::Less);
+        blend_depth_descriptor.set_depth_write_enabled(false);
+        let blend_depth_state = device.new_depth_stencil_state(&blend_depth_descriptor);
 
         let sampler_descriptor = metal::SamplerDescriptor::new();
         sampler_descriptor.set_min_filter(metal::MTLSamplerMinMagFilter::Linear);
@@ -143,7 +176,9 @@ impl RustMetal {
             queue,
             layer,
             pipeline,
+            blend_pipeline,
             depth_state,
+            blend_depth_state,
             depth_texture: None,
             depth_size: (0, 0),
             sampler,
@@ -218,7 +253,16 @@ impl RustMetal {
             self.camera_position[2] + forward[2],
         ];
         let view = look_at(self.camera_position, centre, [0.0, 1.0, 0.0]);
-        let projection = perspective(1.1, width as f32 / height.max(1) as f32, 0.1, 500.0);
+        // 60 degrees and a 0.05 near plane, matching what the shared renderer
+        // gives desert_rust_bevy. Neither rig frustum-culls, so this does not
+        // change how many vertices are processed, but it does change how much
+        // of the screen they cover.
+        let projection = perspective(
+            60.0_f32.to_radians(),
+            width as f32 / height.max(1) as f32,
+            0.05,
+            500.0,
+        );
         let view_projection = metal_renderer::metal_math::mat_mul(projection, view);
 
         let descriptor = RenderPassDescriptor::new();
@@ -243,17 +287,45 @@ impl RustMetal {
         encoder.set_fragment_texture(2, Some(&self.dummy_shadow));
         encoder.set_fragment_texture(3, Some(&self.flat_normal));
 
+        // Opaque first with depth writes, then the transparent ones back to
+        // front with writes off — the order the shared renderer uses. Drawing
+        // everything opaque, as this rig used to, is a different frame.
+        let mut blended: Vec<&GltfMesh> = Vec::new();
         for mesh in &self.meshes {
+            if mesh.is_blend {
+                blended.push(mesh);
+            }
+        }
+        blended.sort_by(|a, b| {
+            let distance = |m: &GltfMesh| {
+                let d = [
+                    m.centre[0] - self.camera_position[0],
+                    m.centre[1] - self.camera_position[1],
+                    m.centre[2] - self.camera_position[2],
+                ];
+                d[0] * d[0] + d[1] * d[1] + d[2] * d[2]
+            };
+            distance(b).total_cmp(&distance(a))
+        });
+
+        for mesh in self.meshes.iter().filter(|m| !m.is_blend).chain(blended.iter().copied()) {
+            if mesh.is_blend {
+                encoder.set_render_pipeline_state(&self.blend_pipeline);
+                encoder.set_depth_stencil_state(&self.blend_depth_state);
+            }
             let uniforms = SponzaUniforms {
                 view_projection,
                 light_pos: [0.0, 0.0, 0.0],
                 light_range: 0.0,
                 light_color: [0.0, 0.0, 0.0, 0.0],
-                sun_dir: [0.47, -0.78, 0.41],
+                sun_dir: SUN_DIRECTION,
                 _sun_pad: 0.0,
-                sun_color: [1.0, 0.98, 0.92, 1.0],
+                // White, because the ECS rig's DirectionalLight is white and
+                // its extractor passes the colour through unchanged. A warmer
+                // tint here made the two rigs render different images.
+                sun_color: [1.0, 1.0, 1.0, 1.0],
                 base_color_factor: mesh.base_color_factor,
-                emissive: [0.0, 0.0, 0.0, 0.0],
+                emissive: mesh.emissive,
                 light_view_projection: identity(),
                 point_light_view_projection: identity(),
                 camera_pos: self.camera_position,
