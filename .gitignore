@@ -1,5 +1,5 @@
 build/
 target/
-DesertNativeBaseline.xcodeproj/
+DesertRustMetal.xcodeproj/
 Sources/Info.plist
 .DS_Store
