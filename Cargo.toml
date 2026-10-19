@@ -11,7 +11,7 @@ crate-type = ["staticlib", "rlib"]
 [dependencies]
 # Only for the shared shader source, the glTF->Metal loader and the matrix
 # helpers. Nothing here touches the ECS-driven renderer or Bevy.
-metal_renderer = { path = "../metal_renderer" }
+metal_renderer = { git = "https://github.com/huyvu8051/metal_renderer" }
 
 [target.'cfg(target_os = "ios")'.dependencies]
 objc = "0.2"
